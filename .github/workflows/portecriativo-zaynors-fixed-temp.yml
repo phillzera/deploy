@@ -1,0 +1,57 @@
+name: portecriativo-zaynors-fixed-temp
+on:
+  pull_request:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  export:
+    if: github.head_ref == 'portecriativo-export-20260918'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Clone and patch exporter
+        run: |
+          git clone --depth 1 https://github.com/zaynors/framer-export.git exporter
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('exporter/scripts/export.js')
+          lines=p.read_text('utf-8').splitlines()
+          out=[]
+          changed=False
+          for line in lines:
+              if 'const resolvedPath = outputPath.replace(' in line:
+                  indent=line[:len(line)-len(line.lstrip())]
+                  out.append(indent + "const resolvedPath = process.platform === 'win32' ? outputPath.replace(/^\\/tmp\\//, `\${TMP}\\\\`) : outputPath;")
+                  changed=True
+              else:
+                  out.append(line)
+          if not changed:
+              raise SystemExit('expected tmp path line not found')
+          p.write_text('\n'.join(out)+'\n','utf-8')
+          PY
+      - name: Export all routes
+        run: |
+          set -euxo pipefail
+          rm -rf full
+          mkdir full
+          cd full
+          node ../exporter/scripts/export.js "https://portecriativo.framer.website/" --with-fonts | tee ../export.log
+          test -s portecriativo.framer.website/index.html
+          test -s portecriativo.framer.website/cases/index.html
+          test -s portecriativo.framer.website/cases/volt/index.html
+          cp ../export.log portecriativo.framer.website/export.log
+          find portecriativo.framer.website -type f | sort > portecriativo.framer.website/file-manifest.txt
+          echo "HTML:"
+          find portecriativo.framer.website -name '*.html' -type f -print
+          du -sh portecriativo.framer.website
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portecriativo-zaynors-fixed
+          path: full/portecriativo.framer.website
+          include-hidden-files: true
+          retention-days: 1

@@ -1,0 +1,36 @@
+name: portecriativo-zaynors-temp
+on:
+  pull_request:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  export:
+    if: github.head_ref == 'portecriativo-export-20260918'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install exporter
+        run: npm install -g git+https://github.com/zaynors/framer-export.git
+      - name: Export site
+        run: |
+          set -euxo pipefail
+          rm -rf zexport
+          mkdir zexport
+          cd zexport
+          framer-export "https://portecriativo.framer.website/" --with-fonts | tee ../zexport.log
+          test -s portecriativo.framer.website/index.html
+          cp ../zexport.log portecriativo.framer.website/export.log
+          find portecriativo.framer.website -type f | sort > portecriativo.framer.website/file-manifest.txt
+          du -sh portecriativo.framer.website
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: portecriativo-zaynors-raw
+          path: zexport/portecriativo.framer.website
+          include-hidden-files: true
+          retention-days: 1
