@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 from urllib.request import Request, urlopen
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import re, sys, html, hashlib, mimetypes, json, shutil
 
@@ -183,6 +183,45 @@ for cat, entries in by_cat.items():
             replacements[html.escape(html.unescape(raw), quote=False)] = local
         download_manifest.append({"source":url,"local":local,"bytes":len(data),"content_type":ctype})
 
+# Download relative binary/data chunks referenced by localized JavaScript modules.
+# Framer CMS modules commonly resolve *.framercms next to their source module.
+relative_manifest = []
+relative_rx = re.compile(r"""[\x60"'](\./[^\x60"']+\.(?:framercms|wasm|bin|dat))(?:\?[^\x60"']*)?[\x60"']""", re.I)
+for raw, (source_url, data, ctype, ext, cat) in list(results.items()):
+    if cat != "modules":
+        continue
+    try:
+        txt = data.decode("utf-8")
+    except Exception:
+        continue
+    for rel in sorted(set(relative_rx.findall(txt))):
+        absolute = urljoin(source_url, rel)
+        name = Path(urlparse(absolute).path).name
+        if not name:
+            continue
+        dest = localized / "modules" / name
+        if dest.exists():
+            continue
+        req = Request(absolute, headers={
+            "User-Agent":"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36",
+            "Referer":"https://portecriativo.framer.website/",
+            "Accept":"*/*",
+        })
+        try:
+            with urlopen(req, timeout=45) as resp:
+                child = resp.read()
+                child_type = (resp.headers.get_content_type() or "application/octet-stream").lower()
+            if child:
+                dest.write_bytes(child)
+                relative_manifest.append({
+                    "source": absolute,
+                    "local": "/" + str(dest.relative_to(root)).replace("\\","/"),
+                    "bytes": len(child),
+                    "content_type": child_type,
+                })
+        except Exception as e:
+            failed[absolute] = f"{type(e).__name__}: {e}"
+
 # Replace exact external resource strings everywhere.
 for p in text_files():
     s = p.read_text("utf-8", errors="ignore")
@@ -213,6 +252,17 @@ for p in text_files():
     # import local in case an editor flag exists in localStorage.
     ns = ns.replace("https://framer.com/edit/runtime-init.mjs", "/assets/js/runtime-init.mjs")
     ns = ns.replace("https://framer.com/edit/init.mjs", "/assets/js/runtime-init.mjs")
+
+    # A root-relative local module path is not itself a valid URL base.
+    # Preserve Framer's new URL(relative, base) semantics by making that base
+    # absolute at runtime, while keeping every referenced file local.
+    local_base_rx = re.compile(
+        r"""new URL\((?P<rel>\x60[^\x60]*\x60|"[^"]*"|'[^']*'),(?P<q>[\x60"'])(?P<base>/assets/[^\x60"']+)(?P=q)\)"""
+    )
+    ns = local_base_rx.sub(
+        lambda m: f"new URL({m.group('rel')},globalThis.location.origin+{m.group('q')}{m.group('base')}{m.group('q')})",
+        ns,
+    )
 
     if ns != s:
         p.write_text(ns, "utf-8")
@@ -316,6 +366,7 @@ report={
     "localized_resources":len(results),
     "failed_resource_downloads":failed,
     "download_manifest":download_manifest,
+    "relative_download_manifest":relative_manifest,
     "renamed_js":js_map,
     "renamed_images":img_map,
 }
