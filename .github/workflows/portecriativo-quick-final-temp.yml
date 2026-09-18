@@ -1,0 +1,64 @@
+name: portecriativo-quick-final-temp
+on:
+  pull_request:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  quick:
+    if: github.head_ref == 'portecriativo-export-20260918'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Export all routes
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/zaynors/framer-export.git exporter
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('exporter/scripts/export.js'); lines=p.read_text('utf-8').splitlines(); out=[]; changed=False
+          for line in lines:
+              if 'const resolvedPath = outputPath.replace(' in line:
+                  indent=line[:len(line)-len(line.lstrip())]
+                  out.append(indent + "const resolvedPath = process.platform === 'win32' ? outputPath.replace(/^\\/tmp\\//, `\${TMP}\\\\`) : outputPath;"); changed=True
+              else: out.append(line)
+          if not changed: raise SystemExit('patch target missing')
+          p.write_text('\n'.join(out)+'\n','utf-8')
+          PY
+          mkdir work && cd work
+          node ../exporter/scripts/export.js "https://portecriativo.framer.website/" --with-fonts > ../export.log
+          cd ..
+          mv work/portecriativo.framer.website portecriativo-final
+          cp export.log portecriativo-final/export.log
+          test -s portecriativo-final/index.html
+          test -s portecriativo-final/cases/index.html
+          test -s portecriativo-final/cases/volt/index.html
+      - name: Localize all resources
+        run: python3 tmp/portecriativo_localize.py portecriativo-final
+      - name: Install audit
+        run: |
+          mkdir audit-runner && cd audit-runner
+          npm init -y >/dev/null
+          npm install puppeteer@24.20.0 pixelmatch@7 pngjs@7
+      - name: Fast pixel and offline audit
+        run: NODE_PATH="$PWD/audit-runner/node_modules" node tmp/portecriativo_quick_audit.cjs portecriativo-final
+      - name: Package inventory
+        if: always()
+        run: |
+          if [ -d portecriativo-final ]; then
+            find portecriativo-final -type f | sort > portecriativo-final/file-manifest.txt
+            du -sh portecriativo-final
+            find portecriativo-final -type f | wc -l
+          fi
+      - name: Upload final package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portecriativo-offline-final-quick
+          path: portecriativo-final
+          include-hidden-files: true
+          retention-days: 1
