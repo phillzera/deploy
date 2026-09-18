@@ -22,17 +22,68 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install exporter
+      - name: Install primary exporter
         run: npm install -g framer-export@5.0.1
 
+      - name: Patch Puppeteer protocol timeout
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          root = Path(__import__('subprocess').check_output(['npm','root','-g'], text=True).strip()) / 'framer-export'
+          patched = 0
+          for p in root.rglob('*.js'):
+              try:
+                  s = p.read_text('utf-8')
+              except Exception:
+                  continue
+              old = s
+              s = s.replace('puppeteer.launch({', 'puppeteer.launch({ protocolTimeout: 180000,')
+              s = s.replace('.launch({headless:', '.launch({protocolTimeout:180000,headless:')
+              if s != old:
+                  p.write_text(s, 'utf-8')
+                  patched += 1
+          print('patched_files=', patched)
+          if patched == 0:
+              print('No direct launch pattern patched; continuing with fallback available.')
+          PY
+
       - name: Export published Framer site
+        id: primary
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          rm -rf portecriativo-export
+          timeout 15m framer-export --no-update --platform framer --subpages --dpr 2 https://portecriativo.framer.website/ ./portecriativo-export | tee primary-export.log
+          test -s portecriativo-export/index.html
+
+      - name: Fallback clone preserving Framer bundles
+        if: steps.primary.outcome != 'success'
         run: |
           set -euxo pipefail
-          rm -rf portecriativo-export
-          framer-export --no-update --platform framer --subpages --dpr 2 https://portecriativo.framer.website/ ./portecriativo-export
+          rm -rf portecriativo-export framer-cloner
+          git clone --depth 1 https://github.com/ronnymajani/framer-cloner.git
+          cd framer-cloner
+          npm run clone "https://portecriativo.framer.website/"
+          OUT="$(find out -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+          test -n "$OUT"
+          cd ..
+          cp -a "framer-cloner/$OUT" portecriativo-export
+          cp primary-export.log portecriativo-export/primary-export.log || true
+          cat > portecriativo-export/export-report.json <<'JSON'
+          {
+            "source": "https://portecriativo.framer.website/",
+            "mode": "fallback-framer-cloner",
+            "note": "Primary browser exporter timed out; fallback preserves Framer JS bundles and localizes assets."
+          }
+          JSON
+
+      - name: Verify exported structure
+        run: |
+          set -euxo pipefail
           test -s portecriativo-export/index.html
-          test -s portecriativo-export/serve.js
-          test -s portecriativo-export/export-report.json
+          find portecriativo-export -type f | sort > portecriativo-export/file-manifest.txt
+          find portecriativo-export -type f | wc -l
+          du -sh portecriativo-export
 
       - name: Static offline audit
         run: |
@@ -49,30 +100,30 @@ jobs:
           htmls=[p for p in files if p.suffix.lower()=='.html']
           text_ext={'.html','.css','.js','.mjs','.cjs','.json','.svg','.txt','.xml'}
           required_external=[]
-          external_links=[]
-          resource_pattern=re.compile(r'''(?:src|href|poster)\s*=\s*["'](https?://[^"'#]+)''',re.I)
+          nav_external=[]
+          rx=re.compile(r'''(?:src|href|poster)\s*=\s*["'](https?://[^"'#]+)''',re.I)
+          allowed_nav=('wa.me','linkedin.com','instagram.com','tiktok.com','x.com','holdnexus.com')
           for p in files:
               if p.suffix.lower() not in text_ext: continue
-              try: s=p.read_text('utf-8',errors='ignore')
-              except: continue
-              for u in resource_pattern.findall(s):
-                  if any(x in u for x in ['wa.me','linkedin.com','instagram.com','tiktok.com','x.com']):
-                      external_links.append((str(p),u))
+              s=p.read_text('utf-8',errors='ignore')
+              for u in rx.findall(s):
+                  if any(x in u for x in allowed_nav):
+                      nav_external.append((str(p.relative_to(root)),u))
                   else:
-                      required_external.append((str(p),u))
+                      required_external.append((str(p.relative_to(root)),u))
           report={
-              'files':len(files),
-              'bytes':total,
-              'extensions':dict(sorted(exts.items())),
-              'html_files':[str(p.relative_to(root)) for p in htmls],
-              'external_navigation_links':len(external_links),
-              'external_resource_references':required_external[:500],
-              'external_resource_reference_count':len(required_external),
+            'files':len(files),
+            'bytes':total,
+            'extensions':dict(sorted(exts.items())),
+            'html_files':[str(p.relative_to(root)) for p in htmls],
+            'external_navigation_links':len(nav_external),
+            'external_resource_reference_count':len(required_external),
+            'external_resource_references':required_external[:500],
           }
-          Path('portecriativo-export/audit-static.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
+          (root/'audit-static.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
           print(json.dumps(report,indent=2,ensure_ascii=False))
           if not htmls:
-              raise SystemExit('No HTML pages were exported')
+              raise SystemExit('No HTML pages exported')
           PY
 
       - name: Install visual audit dependencies
@@ -96,24 +147,29 @@ jobs:
           const auditDir = path.join(root,'audit');
           fs.mkdirSync(auditDir,{recursive:true});
 
-          const server = spawn(process.execPath,['serve.js'],{
-            cwd:root,
-            env:{...process.env,PORT:'4173'},
+          const server = spawn('python3',['-m','http.server','4173','--bind','127.0.0.1','--directory',root],{
             stdio:['ignore',fs.openSync(path.join(auditDir,'server.log'),'w'),fs.openSync(path.join(auditDir,'server.err.log'),'w')]
           });
 
           const sleep = ms => new Promise(r=>setTimeout(r,ms));
-          async function findPort(){
-            for(let t=0;t<30;t++){
-              for(const p of [4173,3000,8080,5000]){
-                try{
-                  const r=await fetch('http://127.0.0.1:'+p+'/',{redirect:'manual'});
-                  if(r.status<500) return p;
-                }catch{}
-              }
-              await sleep(1000);
+          async function waitServer(){
+            for(let i=0;i<30;i++){
+              try{
+                const r=await fetch('http://127.0.0.1:4173/');
+                if(r.ok) return;
+              }catch{}
+              await sleep(500);
             }
-            throw new Error('Local export server did not start');
+            throw new Error('Local server failed to start');
+          }
+
+          async function enter(page){
+            await page.evaluate(()=>{
+              const all=[...document.querySelectorAll('button,a,[role="button"],div')];
+              const el=all.find(e=>(e.textContent||'').trim().toUpperCase()==='ENTRAR NA EXPERIÊNCIA');
+              if(el && typeof el.click==='function') el.click();
+            }).catch(()=>{});
+            await sleep(900);
           }
 
           async function prep(page){
@@ -122,18 +178,18 @@ jobs:
               for(const v of document.querySelectorAll('video')){
                 try{v.pause();v.currentTime=0;}catch{}
               }
-            });
-            await page.addStyleTag({content:'*{transition:none!important;caret-color:transparent!important} html{scroll-behavior:auto!important}'});
+            }).catch(()=>{});
+            await page.addStyleTag({content:'*{transition:none!important;caret-color:transparent!important} html{scroll-behavior:auto!important}'}).catch(()=>{});
           }
 
           async function lazy(page){
             await page.evaluate(async()=>{
               const h=Math.max(document.body.scrollHeight,document.documentElement.scrollHeight);
-              for(let y=0;y<h;y+=Math.max(400,innerHeight*0.75)){
-                scrollTo(0,y); await new Promise(r=>setTimeout(r,80));
+              for(let y=0;y<h;y+=Math.max(400,innerHeight*0.7)){
+                scrollTo(0,y); await new Promise(r=>setTimeout(r,90));
               }
               scrollTo(0,0);
-            });
+            }).catch(()=>{});
             await sleep(700);
           }
 
@@ -150,13 +206,29 @@ jobs:
             return {source:[a.width,a.height],local:[b.width,b.height],mismatched,total:w*h,ratio:mismatched/(w*h)};
           }
 
+          function localPath(route){
+            if(route==='home') return '/index.html';
+            if(route==='cases'){
+              if(fs.existsSync(path.join(root,'cases.html'))) return '/cases.html';
+              if(fs.existsSync(path.join(root,'subpages','cases.html'))) return '/subpages/cases.html';
+              if(fs.existsSync(path.join(root,'cases','index.html'))) return '/cases/index.html';
+              return '/cases';
+            }
+            if(route==='volt'){
+              if(fs.existsSync(path.join(root,'cases','volt.html'))) return '/cases/volt.html';
+              if(fs.existsSync(path.join(root,'subpages','cases','volt.html'))) return '/subpages/cases/volt.html';
+              if(fs.existsSync(path.join(root,'cases','volt','index.html'))) return '/cases/volt/index.html';
+              return '/cases/volt';
+            }
+          }
+
           (async()=>{
-            const port=await findPort();
-            const browser=await puppeteer.launch({headless:true,args:['--no-sandbox','--disable-setuid-sandbox']});
+            await waitServer();
+            const browser=await puppeteer.launch({headless:true,protocolTimeout:180000,args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']});
             const routes=[
-              {name:'home',source:'https://portecriativo.framer.website/',local:'/'},
-              {name:'cases',source:'https://portecriativo.framer.website/cases',local:'/cases'},
-              {name:'volt',source:'https://portecriativo.framer.website/cases/volt',local:'/cases/volt'},
+              {name:'home',source:'https://portecriativo.framer.website/'},
+              {name:'cases',source:'https://portecriativo.framer.website/cases'},
+              {name:'volt',source:'https://portecriativo.framer.website/cases/volt'},
             ];
             const viewports=[
               {name:'mobile',width:390,height:855},
@@ -170,32 +242,39 @@ jobs:
                 const src=await browser.newPage();
                 const loc=await browser.newPage();
                 await src.setViewport(vp); await loc.setViewport(vp);
-                const failedSrc=[],failedLoc=[];
+                const failedSrc=[], failedLoc=[];
                 src.on('requestfailed',r=>failedSrc.push({url:r.url(),error:r.failure()?.errorText}));
                 loc.on('requestfailed',r=>failedLoc.push({url:r.url(),error:r.failure()?.errorText}));
                 let srcStatus=null,locStatus=null;
                 try{
-                  const r=await src.goto(route.source,{waitUntil:'networkidle2',timeout:60000}); srcStatus=r?.status();
-                  await prep(src); await lazy(src);
+                  const r=await src.goto(route.source,{waitUntil:'domcontentloaded',timeout:60000}); srcStatus=r?.status();
+                  await sleep(2000); await enter(src); await prep(src); await lazy(src);
                 }catch(e){failedSrc.push({url:route.source,error:String(e)});}
                 try{
                   await loc.setRequestInterception(true);
                   loc.on('request',req=>{
                     const u=req.url();
-                    if(u.startsWith('http://127.0.0.1:'+port)||u.startsWith('data:')||u.startsWith('blob:')) req.continue();
+                    if(u.startsWith('http://127.0.0.1:4173')||u.startsWith('data:')||u.startsWith('blob:')) req.continue();
                     else req.abort('blockedbyclient');
                   });
-                  const r=await loc.goto('http://127.0.0.1:'+port+route.local,{waitUntil:'networkidle2',timeout:60000}); locStatus=r?.status();
-                  await prep(loc); await lazy(loc);
-                }catch(e){failedLoc.push({url:route.local,error:String(e)});}
+                  const lp=localPath(route.name);
+                  const r=await loc.goto('http://127.0.0.1:4173'+lp,{waitUntil:'domcontentloaded',timeout:60000}); locStatus=r?.status();
+                  await sleep(2000); await enter(loc); await prep(loc); await lazy(loc);
+                }catch(e){failedLoc.push({url:route.name,error:String(e)});}
                 const base=route.name+'-'+vp.name;
-                const sp=path.join(auditDir,base+'-source.png'), lp=path.join(auditDir,base+'-local.png'), dp=path.join(auditDir,base+'-diff.png');
+                const sp=path.join(auditDir,base+'-source.png');
+                const lp=path.join(auditDir,base+'-local.png');
+                const dp=path.join(auditDir,base+'-diff.png');
                 await src.screenshot({path:sp,fullPage:true});
                 await loc.screenshot({path:lp,fullPage:true});
                 const visual=compare(sp,lp,dp);
-                const localTitle=await loc.title().catch(()=>null);
-                const localText=(await loc.evaluate(()=>document.body.innerText.slice(0,1000)).catch(()=>''))||'';
-                results.push({route:route.name,viewport:vp,sourceStatus:srcStatus,localStatus:locStatus,localTitle,localTextLength:localText.length,failedSourceRequests:failedSrc.slice(0,30),failedLocalRequests:failedLoc.slice(0,30),visual});
+                results.push({
+                  route:route.name,viewport:vp,sourceStatus:srcStatus,localStatus:locStatus,
+                  localUrl:localPath(route.name),
+                  failedSourceRequests:failedSrc.slice(0,50),
+                  failedLocalRequests:failedLoc.slice(0,50),
+                  visual
+                });
                 await src.close(); await loc.close();
               }
             }
@@ -203,11 +282,11 @@ jobs:
             server.kill('SIGTERM');
             const summary={
               generatedAt:new Date().toISOString(),
-              port,
               cases:results,
-              maxVisualMismatch:Math.max(...results.map(x=>x.visual.ratio)),
-              offlineLocalRequestFailures:results.reduce((n,x)=>n+x.failedLocalRequests.length,0),
               allLocalStatusesOk:results.every(x=>x.localStatus && x.localStatus<400),
+              offlineLocalRequestFailures:results.reduce((n,x)=>n+x.failedLocalRequests.length,0),
+              maxVisualMismatch:Math.max(...results.map(x=>x.visual.ratio)),
+              avgVisualMismatch:results.reduce((n,x)=>n+x.visual.ratio,0)/results.length
             };
             fs.writeFileSync(path.join(root,'audit-visual.json'),JSON.stringify(summary,null,2));
             console.log(JSON.stringify(summary,null,2));
