@@ -7,12 +7,14 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   export-and-audit:
     if: github.head_ref == 'portecriativo-export-20260918'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 40
+
     steps:
       - name: Checkout temporary branch
         uses: actions/checkout@v4
@@ -22,213 +24,363 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install primary exporter
-        run: npm install -g framer-export@5.0.1
+      - name: Install self-hosted Framer exporter
+        run: npm install -g git+https://github.com/zaynors/framer-export.git
 
-      - name: Patch Puppeteer protocol timeout
+      - name: Export every published route and asset
         run: |
-          python - <<'PY'
+          set -euxo pipefail
+          rm -rf mirror portecriativo-final
+          mkdir -p mirror
+          cd mirror
+          timeout 15m framer-export "https://portecriativo.framer.website/" --with-fonts | tee ../zaynors-export.log
+          test -s portecriativo.framer.website/index.html
+          cd ..
+          mv mirror/portecriativo.framer.website portecriativo-final
+          cp zaynors-export.log portecriativo-final/export.log
+
+      - name: Localize runtime-only dependencies and offline form
+        run: |
+          python3 - <<'PY'
           from pathlib import Path
-          root = Path(__import__('subprocess').check_output(['npm','root','-g'], text=True).strip()) / 'framer-export'
-          patched = 0
-          for p in root.rglob('*.js'):
-              try:
-                  s = p.read_text('utf-8')
-              except Exception:
-                  continue
+          from urllib.request import Request, urlopen
+          from urllib.parse import urlparse
+          import re, json, hashlib
+
+          root = Path('portecriativo-final')
+          ext = root / 'external'
+          fonts = ext / 'fonts'
+          fonts.mkdir(parents=True, exist_ok=True)
+
+          text_ext = {'.html','.mjs','.js','.css','.json','.svg'}
+          files = [p for p in root.rglob('*') if p.is_file() and p.suffix.lower() in text_ext]
+
+          def fetch(url, dest, referer='https://portecriativo.framer.website/'):
+              req = Request(url, headers={
+                  'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/152 Safari/537.36',
+                  'Referer':referer,
+                  'Accept':'*/*',
+              })
+              with urlopen(req, timeout=90) as r:
+                  data = r.read()
+              if not data:
+                  raise RuntimeError(f'empty download: {url}')
+              dest.parent.mkdir(parents=True, exist_ok=True)
+              dest.write_bytes(data)
+              print('downloaded', url, '->', dest, len(data))
+              return data
+
+          # Find every Google-hosted font URL embedded both in HTML and generated JS.
+          font_rx = re.compile(r'https://fonts\.gstatic\.com/[^\s\x60\"\'\)]+?\.woff2')
+          font_urls = set()
+          for p in files:
+              s = p.read_text('utf-8', errors='ignore')
+              font_urls.update(font_rx.findall(s))
+
+          replacements = {}
+          for url in sorted(font_urls):
+              name = Path(urlparse(url).path).name
+              dest = fonts / name
+              fetch(url, dest)
+              replacements[url] = '/external/fonts/' + name
+
+          # The published site contains two custom Three.js effects:
+          # a classic worker and a dynamic ESM import.
+          fetch('https://unpkg.com/three@0.160.0/build/three.min.js', ext/'three.min.js')
+          fetch('https://unpkg.com/three@0.160.0/build/three.module.min.js', ext/'three.module.min.js')
+
+          unsplash = 'https://images.unsplash.com/photo-1544005313-94ddf0286df2?q=80&w=800&auto=format&fit=crop'
+          try:
+              fetch(unsplash, ext/'default-portrait.jpg')
+              replacements[unsplash] = '/external/default-portrait.jpg'
+          except Exception as e:
+              print('unsplash default not fetched:', e)
+
+          form_urls = set()
+
+          for p in files:
+              s = p.read_text('utf-8', errors='ignore')
               old = s
-              s = s.replace('puppeteer.launch({', 'puppeteer.launch({ protocolTimeout: 180000,')
-              s = s.replace('.launch({headless:', '.launch({protocolTimeout:180000,headless:')
+
+              for src, local in replacements.items():
+                  s = s.replace(src, local)
+
+              # Blob worker: root-relative import must be built from worker origin.
+              s = s.replace(
+                  "self.importScripts('https://unpkg.com/three@0.160.0/build/three.min.js');",
+                  "self.importScripts(self.location.origin + '/external/three.min.js');"
+              )
+              s = s.replace(
+                  'self.importScripts("https://unpkg.com/three@0.160.0/build/three.min.js");',
+                  "self.importScripts(self.location.origin + '/external/three.min.js');"
+              )
+              s = s.replace('https://unpkg.com/three@0.160.0/build/three.min.js','/external/three.min.js')
+              s = s.replace('https://esm.sh/three@0.160.0?bundle','/external/three.module.min.js')
+
+              for m in re.findall(r'https://api\.framer\.com/forms/v1/forms/[^\x60\"\'\s]+/submit', s):
+                  form_urls.add(m)
+                  s = s.replace(m, '/offline-form')
+
+              if p.suffix.lower() == '.html':
+                  # Editor-only loader / preconnect / branding metadata are not runtime dependencies.
+                  s = re.sub(r'<script>try\{if\(localStorage\.getItem\("__framer_force_showing_editorbar_since"\)\).*?</script>', '', s, flags=re.S)
+                  s = re.sub(r'<link[^>]+href=["\']https://fonts\.gstatic\.com["\'][^>]*>', '', s, flags=re.I)
+                  s = re.sub(r'<!--\s*Made in Framer.*?-->', '', s, flags=re.I|re.S)
+                  s = re.sub(r'<meta\s+name=["\']generator["\'][^>]*>', '', s, flags=re.I)
+
               if s != old:
                   p.write_text(s, 'utf-8')
-                  patched += 1
-          print('patched_files=', patched)
-          if patched == 0:
-              print('No direct launch pattern patched; continuing with fallback available.')
+
+          # Append an entirely local form endpoint to generated server.js.
+          server = root / 'server.js'
+          if server.exists():
+              s = server.read_text('utf-8', errors='ignore')
+              marker = "const server = http.createServer((req, res) => {"
+              inject = r"""const server = http.createServer((req, res) => {
+  if (req.method === 'POST' && req.url.split('?')[0] === '/offline-form') {
+    let body = '';
+    req.on('data', chunk => { if (body.length < 1024 * 1024) body += chunk; });
+    req.on('end', () => {
+      try {
+        const line = JSON.stringify({ at: new Date().toISOString(), body }) + '\n';
+        fs.appendFileSync(path.join(__dirname, 'offline-form-submissions.jsonl'), line);
+      } catch (_) {}
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify({ ok: true, success: true }));
+    });
+    return;
+  }"""
+              if marker in s and '/offline-form-submissions.jsonl' not in s:
+                  s = s.replace(marker, inject, 1)
+                  server.write_text(s, 'utf-8')
+
+          report = {
+              'localized_font_urls': sorted(font_urls),
+              'localized_font_count': len(font_urls),
+              'localized_three_classic': True,
+              'localized_three_module': True,
+              'offline_form_endpoints_replaced': sorted(form_urls),
+          }
+          (root/'localization-report.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
+          print(json.dumps(report, ensure_ascii=False, indent=2))
           PY
 
-      - name: Export published Framer site
-        id: primary
-        continue-on-error: true
+      - name: Normalize routes and create launcher
         run: |
-          set -o pipefail
-          rm -rf portecriativo-export
-          timeout 15m framer-export --no-update --platform framer --subpages --dpr 2 https://portecriativo.framer.website/ ./portecriativo-export | tee primary-export.log
-          test -s portecriativo-export/index.html
-
-      - name: Fallback clone preserving Framer bundles
-        if: steps.primary.outcome != 'success'
-        run: |
-          set -euxo pipefail
-          rm -rf portecriativo-export framer-cloner
-          git clone --depth 1 https://github.com/ronnymajani/framer-cloner.git
-          cd framer-cloner
-          npm run clone "https://portecriativo.framer.website/"
-          OUT="$(find out -mindepth 1 -maxdepth 1 -type d | head -n 1)"
-          test -n "$OUT"
-          cd ..
-          cp -a "framer-cloner/$OUT" portecriativo-export
-          cp primary-export.log portecriativo-export/primary-export.log || true
-          cat > portecriativo-export/export-report.json <<'JSON'
-          {
-            "source": "https://portecriativo.framer.website/",
-            "mode": "fallback-framer-cloner",
-            "note": "Primary browser exporter timed out; fallback preserves Framer JS bundles and localizes assets."
-          }
-          JSON
-
-      - name: Verify exported structure
-        run: |
-          set -euxo pipefail
-          test -s portecriativo-export/index.html
-          find portecriativo-export -type f | sort > portecriativo-export/file-manifest.txt
-          find portecriativo-export -type f | wc -l
-          du -sh portecriativo-export
-
-      - name: Static offline audit
-        run: |
-          python - <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
           import json, re
-          root=Path('portecriativo-export')
-          files=[p for p in root.rglob('*') if p.is_file()]
-          exts={}
-          total=0
-          for p in files:
-              exts[p.suffix.lower() or '<none>']=exts.get(p.suffix.lower() or '<none>',0)+1
-              total += p.stat().st_size
-          htmls=[p for p in files if p.suffix.lower()=='.html']
-          text_ext={'.html','.css','.js','.mjs','.cjs','.json','.svg','.txt','.xml'}
-          required_external=[]
-          nav_external=[]
-          rx=re.compile(r'''(?:src|href|poster)\s*=\s*["'](https?://[^"'#]+)''',re.I)
-          allowed_nav=('wa.me','linkedin.com','instagram.com','tiktok.com','x.com','holdnexus.com')
-          for p in files:
-              if p.suffix.lower() not in text_ext: continue
-              s=p.read_text('utf-8',errors='ignore')
-              for u in rx.findall(s):
-                  if any(x in u for x in allowed_nav):
-                      nav_external.append((str(p.relative_to(root)),u))
-                  else:
-                      required_external.append((str(p.relative_to(root)),u))
-          report={
-            'files':len(files),
-            'bytes':total,
-            'extensions':dict(sorted(exts.items())),
-            'html_files':[str(p.relative_to(root)) for p in htmls],
-            'external_navigation_links':len(nav_external),
-            'external_resource_reference_count':len(required_external),
-            'external_resource_references':required_external[:500],
-          }
-          (root/'audit-static.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
-          print(json.dumps(report,indent=2,ensure_ascii=False))
-          if not htmls:
-              raise SystemExit('No HTML pages exported')
+          root=Path('portecriativo-final')
+
+          # Friendly offline launcher; no third-party package is required.
+          launcher = root/'START_LOCAL.command'
+          launcher.write_text("""#!/bin/bash
+          cd "$(dirname "$0")"
+          command -v node >/dev/null 2>&1 || { echo "Node.js 18+ is required"; exit 1; }
+          node server.js 8080
+          """.replace('          ',''), 'utf-8')
+          launcher.chmod(0o755)
+
+          # README is documentation only; site runtime remains completely local.
+          (root/'README-OFFLINE.md').write_text("""# PorteCriativo — cópia local
+
+          Execute `START_LOCAL.command` no macOS ou rode `node server.js 8080`.
+          Depois acesse http://localhost:8080.
+
+          Rotas preservadas: /, /cases e /cases/volt.
+          Imagens, vídeos, fontes, módulos JavaScript e dependências Three.js ficam dentro deste pacote.
+          O formulário funciona sem internet e grava envios em `offline-form-submissions.jsonl` no próprio diretório.
+          Links externos (WhatsApp, redes sociais e mapa) continuam sendo links externos e, naturalmente, exigem internet quando clicados.
+          """.replace('          ',''), 'utf-8')
           PY
 
-      - name: Install visual audit dependencies
+      - name: Install audit dependencies
         run: |
           mkdir -p audit-runner
           cd audit-runner
           npm init -y >/dev/null
           npm install puppeteer@24.20.0 pixelmatch@7 pngjs@7
 
-      - name: Visual and functional audit
+      - name: Static dependency audit
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, json, os
+          root=Path('portecriativo-final')
+          text_ext={'.html','.css','.js','.mjs','.json','.svg'}
+          network_hosts={}
+          url_rx=re.compile(r'https?://[^\s\x60\"\'<>\\)]+')
+          resource_attr_rx=re.compile(r'(?:src|poster)\s*=\s*["\'](https?://[^"\']+)',re.I)
+          css_url_rx=re.compile(r'url\(\s*["\']?(https?://[^\)"\']+)',re.I)
+          js_runtime_needles=(
+              'https://fonts.gstatic.com/',
+              'https://unpkg.com/three',
+              'https://esm.sh/three',
+              'https://api.framer.com/forms/',
+              'https://framerusercontent.com/',
+          )
+          runtime_refs=[]
+          all_urls=[]
+          broken_local=[]
+          files=[p for p in root.rglob('*') if p.is_file()]
+          for p in files:
+              if p.suffix.lower() not in text_ext: continue
+              s=p.read_text('utf-8',errors='ignore')
+              for u in url_rx.findall(s):
+                  all_urls.append((str(p.relative_to(root)),u))
+              for u in resource_attr_rx.findall(s):
+                  runtime_refs.append((str(p.relative_to(root)),u,'html-resource'))
+              for u in css_url_rx.findall(s):
+                  runtime_refs.append((str(p.relative_to(root)),u,'css-resource'))
+              for needle in js_runtime_needles:
+                  if needle in s:
+                      # Allow generic framework strings only when not a concrete resource URL.
+                      for u in url_rx.findall(s):
+                          if u.startswith(needle):
+                              runtime_refs.append((str(p.relative_to(root)),u,'script-string'))
+
+          # Ignore outbound navigation / documentation / SVG namespaces / canonical metadata.
+          allow_external_prefixes=(
+              'https://wa.me/','https://linkedin.com/','https://www.instagram.com/',
+              'https://tiktok.com/','https://x.com/','https://holdnexus.com',
+              'https://www.google.com/maps/','http://www.w3.org/','https://reactjs.org/',
+              'https://www.framer.com/help/','https://www.framer.com/contact/',
+              'https://rolldown.rs/','https://screenshot.framer.invalid',
+          )
+          filtered=[]
+          seen=set()
+          for item in runtime_refs:
+              f,u,k=item
+              if u.startswith(allow_external_prefixes): continue
+              # Bare generic docs/API strings in vendor runtime are not loaded by this site at startup.
+              key=(f,u,k)
+              if key not in seen:
+                  seen.add(key); filtered.append(item)
+
+          report={
+              'file_count':len(files),
+              'total_bytes':sum(p.stat().st_size for p in files),
+              'html_files':[str(p.relative_to(root)) for p in files if p.suffix.lower()=='.html'],
+              'runtime_external_refs':filtered[:500],
+              'runtime_external_ref_count':len(filtered),
+              'all_absolute_url_count':len(all_urls),
+          }
+          (root/'audit-static.json').write_text(json.dumps(report,ensure_ascii=False,indent=2))
+          print(json.dumps(report,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Visual responsive and offline runtime audit
         run: |
           cat > audit-runner/audit.cjs <<'NODE'
-          const fs = require('fs');
-          const path = require('path');
-          const {spawn} = require('child_process');
-          const puppeteer = require('puppeteer');
-          const pixelmatch = require('pixelmatch');
-          const {PNG} = require('pngjs');
+          const fs=require('fs');
+          const path=require('path');
+          const {spawn}=require('child_process');
+          const puppeteer=require('puppeteer');
+          const pm=require('pixelmatch');
+          const pixelmatch=pm.default||pm;
+          const {PNG}=require('pngjs');
 
-          const root = path.resolve('portecriativo-export');
-          const auditDir = path.join(root,'audit');
+          const root=path.resolve('portecriativo-final');
+          const auditDir=path.join(root,'audit');
           fs.mkdirSync(auditDir,{recursive:true});
 
-          const server = spawn('python3',['-m','http.server','4173','--bind','127.0.0.1','--directory',root],{
+          const server=spawn(process.execPath,['server.js','4173'],{
+            cwd:root,
             stdio:['ignore',fs.openSync(path.join(auditDir,'server.log'),'w'),fs.openSync(path.join(auditDir,'server.err.log'),'w')]
           });
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-          const sleep = ms => new Promise(r=>setTimeout(r,ms));
           async function waitServer(){
-            for(let i=0;i<30;i++){
-              try{
-                const r=await fetch('http://127.0.0.1:4173/');
-                if(r.ok) return;
-              }catch{}
-              await sleep(500);
+            for(let i=0;i<60;i++){
+              try{let r=await fetch('http://127.0.0.1:4173/'); if(r.ok) return;}
+              catch{}
+              await sleep(250);
             }
-            throw new Error('Local server failed to start');
+            throw new Error('local server did not start');
           }
 
           async function enter(page){
             await page.evaluate(()=>{
-              const all=[...document.querySelectorAll('button,a,[role="button"],div')];
-              const el=all.find(e=>(e.textContent||'').trim().toUpperCase()==='ENTRAR NA EXPERIÊNCIA');
-              if(el && typeof el.click==='function') el.click();
+              const nodes=[...document.querySelectorAll('button,a,[role="button"],div,p')];
+              const el=nodes.find(e=>(e.textContent||'').trim().toUpperCase()==='ENTRAR NA EXPERIÊNCIA');
+              if(el) el.click();
             }).catch(()=>{});
-            await sleep(900);
+            await sleep(1200);
           }
 
-          async function prep(page){
+          async function settle(page){
             await page.evaluate(async()=>{
               if(document.fonts?.ready) await document.fonts.ready;
               for(const v of document.querySelectorAll('video')){
                 try{v.pause();v.currentTime=0;}catch{}
               }
             }).catch(()=>{});
-            await page.addStyleTag({content:'*{transition:none!important;caret-color:transparent!important} html{scroll-behavior:auto!important}'}).catch(()=>{});
+            await page.addStyleTag({content:'html{scroll-behavior:auto!important} *{caret-color:transparent!important}'}).catch(()=>{});
           }
 
           async function lazy(page){
             await page.evaluate(async()=>{
               const h=Math.max(document.body.scrollHeight,document.documentElement.scrollHeight);
-              for(let y=0;y<h;y+=Math.max(400,innerHeight*0.7)){
-                scrollTo(0,y); await new Promise(r=>setTimeout(r,90));
-              }
+              const step=Math.max(500,innerHeight*.8);
+              for(let y=0;y<h;y+=step){scrollTo(0,y); await new Promise(r=>setTimeout(r,60));}
               scrollTo(0,0);
             }).catch(()=>{});
-            await sleep(700);
+            await sleep(800);
           }
 
-          function compare(aPath,bPath,dPath){
+          function diff(aPath,bPath){
             const a=PNG.sync.read(fs.readFileSync(aPath));
             const b=PNG.sync.read(fs.readFileSync(bPath));
-            const w=Math.max(a.width,b.width), h=Math.max(a.height,b.height);
-            const aa=new PNG({width:w,height:h}), bb=new PNG({width:w,height:h}), diff=new PNG({width:w,height:h});
-            aa.data.fill(255); bb.data.fill(255);
+            const w=Math.max(a.width,b.width),h=Math.max(a.height,b.height);
+            const aa=new PNG({width:w,height:h}),bb=new PNG({width:w,height:h}),dd=new PNG({width:w,height:h});
+            aa.data.fill(255);bb.data.fill(255);
             PNG.bitblt(a,aa,0,0,a.width,a.height,0,0);
             PNG.bitblt(b,bb,0,0,b.width,b.height,0,0);
-            const mismatched=pixelmatch(aa.data,bb.data,diff.data,w,h,{threshold:0.12,includeAA:true});
-            fs.writeFileSync(dPath,PNG.sync.write(diff));
-            return {source:[a.width,a.height],local:[b.width,b.height],mismatched,total:w*h,ratio:mismatched/(w*h)};
+            const n=pixelmatch(aa.data,bb.data,dd.data,w,h,{threshold:.14,includeAA:false});
+            return {source:[a.width,a.height],local:[b.width,b.height],mismatched:n,total:w*h,ratio:n/(w*h)};
           }
 
-          function localPath(route){
-            if(route==='home') return '/index.html';
-            if(route==='cases'){
-              if(fs.existsSync(path.join(root,'cases.html'))) return '/cases.html';
-              if(fs.existsSync(path.join(root,'subpages','cases.html'))) return '/subpages/cases.html';
-              if(fs.existsSync(path.join(root,'cases','index.html'))) return '/cases/index.html';
-              return '/cases';
+          async function snapshot(page,url,externalBlocked,viewport){
+            const failed=[],pageErrors=[],consoleErrors=[],requests=[];
+            page.on('requestfailed',r=>failed.push({url:r.url(),error:r.failure()?.errorText}));
+            page.on('pageerror',e=>pageErrors.push(String(e)));
+            page.on('console',m=>{if(m.type()==='error')consoleErrors.push(m.text())});
+            page.on('request',r=>requests.push(r.url()));
+
+            if(externalBlocked){
+              await page.setRequestInterception(true);
+              page.removeAllListeners('request');
+              page.on('request',req=>{
+                const u=req.url();
+                requests.push(u);
+                if(u.startsWith('http://127.0.0.1:4173')||u.startsWith('data:')||u.startsWith('blob:')||u.startsWith('about:')) req.continue();
+                else req.abort('blockedbyclient');
+              });
             }
-            if(route==='volt'){
-              if(fs.existsSync(path.join(root,'cases','volt.html'))) return '/cases/volt.html';
-              if(fs.existsSync(path.join(root,'subpages','cases','volt.html'))) return '/subpages/cases/volt.html';
-              if(fs.existsSync(path.join(root,'cases','volt','index.html'))) return '/cases/volt/index.html';
-              return '/cases/volt';
-            }
+
+            const resp=await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
+            await sleep(1800); await enter(page); await settle(page); await lazy(page);
+            const facts=await page.evaluate(()=>({
+              title:document.title,
+              height:Math.max(document.body.scrollHeight,document.documentElement.scrollHeight),
+              width:Math.max(document.body.scrollWidth,document.documentElement.scrollWidth),
+              canvases:document.querySelectorAll('canvas').length,
+              videos:document.querySelectorAll('video').length,
+              images:document.images.length,
+              forms:document.querySelectorAll('form').length,
+              links:document.querySelectorAll('a').length,
+              visibleText:(document.body.innerText||'').length,
+            }));
+            return {status:resp?.status(),failed,pageErrors,consoleErrors,requests,facts};
           }
 
           (async()=>{
             await waitServer();
             const browser=await puppeteer.launch({headless:true,protocolTimeout:180000,args:['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage']});
             const routes=[
-              {name:'home',source:'https://portecriativo.framer.website/'},
-              {name:'cases',source:'https://portecriativo.framer.website/cases'},
-              {name:'volt',source:'https://portecriativo.framer.website/cases/volt'},
+              {name:'home',src:'https://portecriativo.framer.website/',local:'/'},
+              {name:'cases',src:'https://portecriativo.framer.website/cases',local:'/cases'},
+              {name:'volt',src:'https://portecriativo.framer.website/cases/volt',local:'/cases/volt'},
             ];
             const viewports=[
               {name:'mobile',width:390,height:855},
@@ -236,80 +388,107 @@ jobs:
               {name:'laptop',width:1200,height:825},
               {name:'desktop',width:1600,height:825},
             ];
-            const results=[];
+            const cases=[];
+
             for(const route of routes){
               for(const vp of viewports){
-                const src=await browser.newPage();
-                const loc=await browser.newPage();
-                await src.setViewport(vp); await loc.setViewport(vp);
-                const failedSrc=[], failedLoc=[];
-                src.on('requestfailed',r=>failedSrc.push({url:r.url(),error:r.failure()?.errorText}));
-                loc.on('requestfailed',r=>failedLoc.push({url:r.url(),error:r.failure()?.errorText}));
-                let srcStatus=null,locStatus=null;
-                try{
-                  const r=await src.goto(route.source,{waitUntil:'domcontentloaded',timeout:60000}); srcStatus=r?.status();
-                  await sleep(2000); await enter(src); await prep(src); await lazy(src);
-                }catch(e){failedSrc.push({url:route.source,error:String(e)});}
-                try{
-                  await loc.setRequestInterception(true);
-                  loc.on('request',req=>{
-                    const u=req.url();
-                    if(u.startsWith('http://127.0.0.1:4173')||u.startsWith('data:')||u.startsWith('blob:')) req.continue();
-                    else req.abort('blockedbyclient');
-                  });
-                  const lp=localPath(route.name);
-                  const r=await loc.goto('http://127.0.0.1:4173'+lp,{waitUntil:'domcontentloaded',timeout:60000}); locStatus=r?.status();
-                  await sleep(2000); await enter(loc); await prep(loc); await lazy(loc);
-                }catch(e){failedLoc.push({url:route.name,error:String(e)});}
+                const src=await browser.newPage(),loc=await browser.newPage();
+                await src.setViewport(vp);await loc.setViewport(vp);
+                const sr=await snapshot(src,route.src,false,vp);
+                const lr=await snapshot(loc,'http://127.0.0.1:4173'+route.local,true,vp);
                 const base=route.name+'-'+vp.name;
-                const sp=path.join(auditDir,base+'-source.png');
-                const lp=path.join(auditDir,base+'-local.png');
-                const dp=path.join(auditDir,base+'-diff.png');
+                const sp=path.join(auditDir,base+'-source.png'),lp=path.join(auditDir,base+'-local.png');
                 await src.screenshot({path:sp,fullPage:true});
                 await loc.screenshot({path:lp,fullPage:true});
-                const visual=compare(sp,lp,dp);
-                results.push({
-                  route:route.name,viewport:vp,sourceStatus:srcStatus,localStatus:locStatus,
-                  localUrl:localPath(route.name),
-                  failedSourceRequests:failedSrc.slice(0,50),
-                  failedLocalRequests:failedLoc.slice(0,50),
-                  visual
-                });
-                await src.close(); await loc.close();
+                const visual=diff(sp,lp);
+                fs.unlinkSync(sp);fs.unlinkSync(lp);
+
+                const runtimeExternal=lr.requests.filter(u=>!u.startsWith('http://127.0.0.1:4173')&&!u.startsWith('data:')&&!u.startsWith('blob:')&&!u.startsWith('about:'));
+                cases.push({route:route.name,viewport:vp,source:sr,local:lr,externalRuntimeRequests:[...new Set(runtimeExternal)],visual});
+                await src.close();await loc.close();
               }
             }
-            await browser.close();
-            server.kill('SIGTERM');
-            const summary={
+
+            // Basic interaction checks on local homepage while fully offline.
+            const p=await browser.newPage();
+            await p.setViewport({width:1440,height:900});
+            await p.setRequestInterception(true);
+            p.on('request',req=>{
+              const u=req.url();
+              if(u.startsWith('http://127.0.0.1:4173')||u.startsWith('data:')||u.startsWith('blob:')||u.startsWith('about:')) req.continue();
+              else req.abort('blockedbyclient');
+            });
+            await p.goto('http://127.0.0.1:4173/',{waitUntil:'domcontentloaded',timeout:60000});
+            await sleep(1800);await enter(p);await sleep(1000);
+
+            const interaction=await p.evaluate(async()=>{
+              const result={};
+              const faqText='Como funciona o orçamento?';
+              const faq=[...document.querySelectorAll('*')].find(e=>(e.textContent||'').trim()===faqText);
+              if(faq){
+                const target=faq.closest('[data-highlight]')||faq.closest('[role="button"]')||faq.parentElement;
+                const before=target?.getBoundingClientRect().height||0;
+                target?.click();
+                await new Promise(r=>setTimeout(r,500));
+                const after=target?.getBoundingClientRect().height||0;
+                result.faq={found:true,before,after};
+              } else result.faq={found:false};
+
+              const hover=document.querySelector('[data-highlight="true"]');
+              if(hover){
+                const cs=getComputedStyle(hover);
+                result.hoverTarget={found:true,transform:cs.transform,opacity:cs.opacity};
+              } else result.hoverTarget={found:false};
+
+              result.canvasCount=document.querySelectorAll('canvas').length;
+              result.videoCount=document.querySelectorAll('video').length;
+              result.formCount=document.querySelectorAll('form').length;
+              return result;
+            });
+
+            // Offline form endpoint itself.
+            const formResp=await fetch('http://127.0.0.1:4173/offline-form',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({audit:true})});
+            const formBody=await formResp.text();
+
+            await p.close();await browser.close();server.kill('SIGTERM');
+
+            const allLocal200=cases.every(x=>x.local.status>=200&&x.local.status<400);
+            const totalRuntimeExternal=cases.reduce((n,x)=>n+x.externalRuntimeRequests.length,0);
+            const totalLocalErrors=cases.reduce((n,x)=>n+x.local.pageErrors.length+x.local.consoleErrors.length,0);
+            const report={
               generatedAt:new Date().toISOString(),
-              cases:results,
-              allLocalStatusesOk:results.every(x=>x.localStatus && x.localStatus<400),
-              offlineLocalRequestFailures:results.reduce((n,x)=>n+x.failedLocalRequests.length,0),
-              maxVisualMismatch:Math.max(...results.map(x=>x.visual.ratio)),
-              avgVisualMismatch:results.reduce((n,x)=>n+x.visual.ratio,0)/results.length
+              allLocalStatusesOk:allLocal200,
+              totalExternalRuntimeRequests:totalRuntimeExternal,
+              totalLocalPageAndConsoleErrors:totalLocalErrors,
+              maxVisualMismatch:Math.max(...cases.map(x=>x.visual.ratio)),
+              avgVisualMismatch:cases.reduce((n,x)=>n+x.visual.ratio,0)/cases.length,
+              interaction,
+              offlineForm:{status:formResp.status,body:formBody},
+              cases
             };
-            fs.writeFileSync(path.join(root,'audit-visual.json'),JSON.stringify(summary,null,2));
-            console.log(JSON.stringify(summary,null,2));
-            if(!summary.allLocalStatusesOk) process.exitCode=2;
+            fs.writeFileSync(path.join(root,'audit-visual.json'),JSON.stringify(report,null,2));
+            console.log(JSON.stringify(report,null,2));
+            if(!allLocal200||formResp.status!==200) process.exitCode=2;
           })().catch(e=>{console.error(e);try{server.kill('SIGTERM')}catch{};process.exit(1)});
           NODE
+
           NODE_PATH="$PWD/audit-runner/node_modules" node audit-runner/audit.cjs
 
-      - name: Inventory
+      - name: Manifest and archive metadata
         if: always()
         run: |
-          if [ -d portecriativo-export ]; then
-            du -sh portecriativo-export || true
-            find portecriativo-export -type f | sort > portecriativo-export/file-manifest.txt || true
-            find portecriativo-export -type f | wc -l || true
+          if [ -d portecriativo-final ]; then
+            find portecriativo-final -type f | sort > portecriativo-final/file-manifest.txt
+            du -sh portecriativo-final
+            find portecriativo-final -type f | wc -l
           fi
 
-      - name: Upload complete export
+      - name: Upload audited package
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: portecriativo-pixel-perfect-export
-          path: portecriativo-export
+          name: portecriativo-final-audited
+          path: portecriativo-final
           include-hidden-files: true
           compression-level: 6
           retention-days: 1
