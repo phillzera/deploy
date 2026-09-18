@@ -100,7 +100,7 @@ for p in text_files():
     raw_urls.update(url_rx.findall(s))
 
 def clean_raw(raw):
-    raw = raw.rstrip(".,;]}\")
+    raw = raw.rstrip(".,;]}\\\\")
     return raw
 
 candidates = {}
