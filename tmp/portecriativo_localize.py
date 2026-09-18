@@ -190,16 +190,29 @@ for p in text_files():
     for raw, local in replacements.items():
         ns = ns.replace(raw, local)
 
-    # Internal navigation must remain internal when served locally.
-    ns = ns.replace("https://portecriativo.framer.website/", "/")
-    ns = ns.replace("https://portecriativo.framer.website", "")
+    # Keep Framer's canonical base inside JavaScript: the router uses it as a
+    # valid URL base. Only rewrite actual HTML hrefs back to local routes.
+    if p.suffix.lower() == ".html":
+        ns = re.sub(
+            r'''href=(["'])https://portecriativo\.framer\.website(?P<path>/[^"'#? ]*)?(?P<tail>[?#][^"']*)?\1''',
+            lambda m: f'href={m.group(1)}{(m.group("path") or "/")}{(m.group("tail") or "")}{m.group(1)}',
+            ns,
+        )
+        # Analytics is not part of the visitor UI and cannot run offline.
+        ns = re.sub(
+            r'''<script[^>]+src=["']https://events\.framer\.com/script\?v=2["'][^>]*>\s*</script>''',
+            "",
+            ns,
+            flags=re.I,
+        )
 
     # Form posts are persisted by the local server instead of calling Framer.
     ns = re.sub(r"https://api\.framer\.com/forms/v1/forms/[A-Za-z0-9-]+/submit", "/offline-form", ns)
 
-    # Editor/analytics endpoints are not part of the visitor experience.
-    ns = ns.replace("https://framer.com/edit/init.mjs", "/assets/localized/data/editor-disabled.mjs")
-    ns = ns.replace("https://events.framer.com", "data:,")
+    # The exporter already captured Framer's editor runtime. Keep the dynamic
+    # import local in case an editor flag exists in localStorage.
+    ns = ns.replace("https://framer.com/edit/runtime-init.mjs", "/assets/js/runtime-init.mjs")
+    ns = ns.replace("https://framer.com/edit/init.mjs", "/assets/js/runtime-init.mjs")
 
     if ns != s:
         p.write_text(ns, "utf-8")
