@@ -1,0 +1,102 @@
+name: portecriativo-finalize-temp
+on:
+  pull_request:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  finalize:
+    if: github.head_ref == 'portecriativo-export-20260918'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Export all Framer routes
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 https://github.com/zaynors/framer-export.git exporter
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('exporter/scripts/export.js')
+          lines=p.read_text('utf-8').splitlines()
+          out=[]; changed=False
+          for line in lines:
+              if 'const resolvedPath = outputPath.replace(' in line:
+                  indent=line[:len(line)-len(line.lstrip())]
+                  out.append(indent + "const resolvedPath = process.platform === 'win32' ? outputPath.replace(/^\\/tmp\\//, `\${TMP}\\\\`) : outputPath;")
+                  changed=True
+              else: out.append(line)
+          if not changed: raise SystemExit('tmp patch target missing')
+          p.write_text('\n'.join(out)+'\n','utf-8')
+          PY
+          rm -rf work portecriativo-final
+          mkdir work
+          cd work
+          node ../exporter/scripts/export.js "https://portecriativo.framer.website/" --with-fonts | tee ../export.log
+          cd ..
+          mv work/portecriativo.framer.website portecriativo-final
+          cp export.log portecriativo-final/export.log
+          test -s portecriativo-final/index.html
+          test -s portecriativo-final/cases/index.html
+          test -s portecriativo-final/cases/volt/index.html
+
+      - name: Localize assets, videos, fonts, 3D and form
+        run: |
+          python3 tmp/portecriativo_localize.py portecriativo-final
+          find portecriativo-final -type f | sort > portecriativo-final/file-manifest.txt
+          du -sh portecriativo-final
+          find portecriativo-final -type f | wc -l
+
+      - name: Static offline dependency scan
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re,json
+          root=Path('portecriativo-final')
+          text_ext={'.html','.mjs','.js','.css','.json','.svg'}
+          urls=[]
+          for p in root.rglob('*'):
+              if p.is_file() and p.suffix.lower() in text_ext:
+                  s=p.read_text('utf-8',errors='ignore')
+                  for u in re.findall(r'https?://[^\s\x60"\'<>\\)]+',s):
+                      urls.append((str(p.relative_to(root)),u))
+          runtime_hosts=('framerusercontent.com','fonts.gstatic.com','unpkg.com','esm.sh','images.unsplash.com','api.framer.com/forms','events.framer.com')
+          residual=[x for x in urls if any(h in x[1] for h in runtime_hosts)]
+          report={'absolute_url_count':len(urls),'residual_runtime_resource_count':len(residual),'residual_runtime_resources':residual[:1000]}
+          (root/'STATIC-AUDIT.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          PY
+
+      - name: Install browser audit dependencies
+        run: |
+          mkdir audit-runner
+          cd audit-runner
+          npm init -y >/dev/null
+          npm install puppeteer@24.20.0 pixelmatch@7 pngjs@7
+
+      - name: Pixel, responsive, interaction and no-network audit
+        run: |
+          NODE_PATH="$PWD/audit-runner/node_modules" node tmp/portecriativo_audit.cjs portecriativo-final
+
+      - name: Final inventory
+        if: always()
+        run: |
+          if [ -d portecriativo-final ]; then
+            find portecriativo-final -type f | sort > portecriativo-final/file-manifest.txt
+            du -sh portecriativo-final
+            find portecriativo-final -type f | wc -l
+          fi
+
+      - name: Upload final audited package
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portecriativo-offline-final
+          path: portecriativo-final
+          include-hidden-files: true
+          compression-level: 6
+          retention-days: 1
