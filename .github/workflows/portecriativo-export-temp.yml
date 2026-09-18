@@ -1,0 +1,236 @@
+name: portecriativo-export-temp
+
+on:
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  export-and-audit:
+    if: github.head_ref == 'portecriativo-export-20260918'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout temporary branch
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install exporter
+        run: npm install -g framer-export@5.0.1
+
+      - name: Export published Framer site
+        run: |
+          set -euxo pipefail
+          rm -rf portecriativo-export
+          framer-export --no-update --platform framer --subpages --dpr 2 https://portecriativo.framer.website/ ./portecriativo-export
+          test -s portecriativo-export/index.html
+          test -s portecriativo-export/serve.js
+          test -s portecriativo-export/export-report.json
+
+      - name: Static offline audit
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import json, re
+          root=Path('portecriativo-export')
+          files=[p for p in root.rglob('*') if p.is_file()]
+          exts={}
+          total=0
+          for p in files:
+              exts[p.suffix.lower() or '<none>']=exts.get(p.suffix.lower() or '<none>',0)+1
+              total += p.stat().st_size
+          htmls=[p for p in files if p.suffix.lower()=='.html']
+          text_ext={'.html','.css','.js','.mjs','.cjs','.json','.svg','.txt','.xml'}
+          required_external=[]
+          external_links=[]
+          resource_pattern=re.compile(r'''(?:src|href|poster)\s*=\s*["'](https?://[^"'#]+)''',re.I)
+          for p in files:
+              if p.suffix.lower() not in text_ext: continue
+              try: s=p.read_text('utf-8',errors='ignore')
+              except: continue
+              for u in resource_pattern.findall(s):
+                  if any(x in u for x in ['wa.me','linkedin.com','instagram.com','tiktok.com','x.com']):
+                      external_links.append((str(p),u))
+                  else:
+                      required_external.append((str(p),u))
+          report={
+              'files':len(files),
+              'bytes':total,
+              'extensions':dict(sorted(exts.items())),
+              'html_files':[str(p.relative_to(root)) for p in htmls],
+              'external_navigation_links':len(external_links),
+              'external_resource_references':required_external[:500],
+              'external_resource_reference_count':len(required_external),
+          }
+          Path('portecriativo-export/audit-static.json').write_text(json.dumps(report,indent=2,ensure_ascii=False))
+          print(json.dumps(report,indent=2,ensure_ascii=False))
+          if not htmls:
+              raise SystemExit('No HTML pages were exported')
+          PY
+
+      - name: Install visual audit dependencies
+        run: |
+          mkdir -p audit-runner
+          cd audit-runner
+          npm init -y >/dev/null
+          npm install puppeteer@24.20.0 pixelmatch@7 pngjs@7
+
+      - name: Visual and functional audit
+        run: |
+          cat > audit-runner/audit.cjs <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+          const {spawn} = require('child_process');
+          const puppeteer = require('puppeteer');
+          const pixelmatch = require('pixelmatch');
+          const {PNG} = require('pngjs');
+
+          const root = path.resolve('portecriativo-export');
+          const auditDir = path.join(root,'audit');
+          fs.mkdirSync(auditDir,{recursive:true});
+
+          const server = spawn(process.execPath,['serve.js'],{
+            cwd:root,
+            env:{...process.env,PORT:'4173'},
+            stdio:['ignore',fs.openSync(path.join(auditDir,'server.log'),'w'),fs.openSync(path.join(auditDir,'server.err.log'),'w')]
+          });
+
+          const sleep = ms => new Promise(r=>setTimeout(r,ms));
+          async function findPort(){
+            for(let t=0;t<30;t++){
+              for(const p of [4173,3000,8080,5000]){
+                try{
+                  const r=await fetch('http://127.0.0.1:'+p+'/',{redirect:'manual'});
+                  if(r.status<500) return p;
+                }catch{}
+              }
+              await sleep(1000);
+            }
+            throw new Error('Local export server did not start');
+          }
+
+          async function prep(page){
+            await page.evaluate(async()=>{
+              if(document.fonts?.ready) await document.fonts.ready;
+              for(const v of document.querySelectorAll('video')){
+                try{v.pause();v.currentTime=0;}catch{}
+              }
+            });
+            await page.addStyleTag({content:'*{transition:none!important;caret-color:transparent!important} html{scroll-behavior:auto!important}'});
+          }
+
+          async function lazy(page){
+            await page.evaluate(async()=>{
+              const h=Math.max(document.body.scrollHeight,document.documentElement.scrollHeight);
+              for(let y=0;y<h;y+=Math.max(400,innerHeight*0.75)){
+                scrollTo(0,y); await new Promise(r=>setTimeout(r,80));
+              }
+              scrollTo(0,0);
+            });
+            await sleep(700);
+          }
+
+          function compare(aPath,bPath,dPath){
+            const a=PNG.sync.read(fs.readFileSync(aPath));
+            const b=PNG.sync.read(fs.readFileSync(bPath));
+            const w=Math.max(a.width,b.width), h=Math.max(a.height,b.height);
+            const aa=new PNG({width:w,height:h}), bb=new PNG({width:w,height:h}), diff=new PNG({width:w,height:h});
+            aa.data.fill(255); bb.data.fill(255);
+            PNG.bitblt(a,aa,0,0,a.width,a.height,0,0);
+            PNG.bitblt(b,bb,0,0,b.width,b.height,0,0);
+            const mismatched=pixelmatch(aa.data,bb.data,diff.data,w,h,{threshold:0.12,includeAA:true});
+            fs.writeFileSync(dPath,PNG.sync.write(diff));
+            return {source:[a.width,a.height],local:[b.width,b.height],mismatched,total:w*h,ratio:mismatched/(w*h)};
+          }
+
+          (async()=>{
+            const port=await findPort();
+            const browser=await puppeteer.launch({headless:true,args:['--no-sandbox','--disable-setuid-sandbox']});
+            const routes=[
+              {name:'home',source:'https://portecriativo.framer.website/',local:'/'},
+              {name:'cases',source:'https://portecriativo.framer.website/cases',local:'/cases'},
+              {name:'volt',source:'https://portecriativo.framer.website/cases/volt',local:'/cases/volt'},
+            ];
+            const viewports=[
+              {name:'mobile',width:390,height:855},
+              {name:'tablet',width:810,height:825},
+              {name:'laptop',width:1200,height:825},
+              {name:'desktop',width:1600,height:825},
+            ];
+            const results=[];
+            for(const route of routes){
+              for(const vp of viewports){
+                const src=await browser.newPage();
+                const loc=await browser.newPage();
+                await src.setViewport(vp); await loc.setViewport(vp);
+                const failedSrc=[],failedLoc=[];
+                src.on('requestfailed',r=>failedSrc.push({url:r.url(),error:r.failure()?.errorText}));
+                loc.on('requestfailed',r=>failedLoc.push({url:r.url(),error:r.failure()?.errorText}));
+                let srcStatus=null,locStatus=null;
+                try{
+                  const r=await src.goto(route.source,{waitUntil:'networkidle2',timeout:60000}); srcStatus=r?.status();
+                  await prep(src); await lazy(src);
+                }catch(e){failedSrc.push({url:route.source,error:String(e)});}
+                try{
+                  await loc.setRequestInterception(true);
+                  loc.on('request',req=>{
+                    const u=req.url();
+                    if(u.startsWith('http://127.0.0.1:'+port)||u.startsWith('data:')||u.startsWith('blob:')) req.continue();
+                    else req.abort('blockedbyclient');
+                  });
+                  const r=await loc.goto('http://127.0.0.1:'+port+route.local,{waitUntil:'networkidle2',timeout:60000}); locStatus=r?.status();
+                  await prep(loc); await lazy(loc);
+                }catch(e){failedLoc.push({url:route.local,error:String(e)});}
+                const base=route.name+'-'+vp.name;
+                const sp=path.join(auditDir,base+'-source.png'), lp=path.join(auditDir,base+'-local.png'), dp=path.join(auditDir,base+'-diff.png');
+                await src.screenshot({path:sp,fullPage:true});
+                await loc.screenshot({path:lp,fullPage:true});
+                const visual=compare(sp,lp,dp);
+                const localTitle=await loc.title().catch(()=>null);
+                const localText=(await loc.evaluate(()=>document.body.innerText.slice(0,1000)).catch(()=>''))||'';
+                results.push({route:route.name,viewport:vp,sourceStatus:srcStatus,localStatus:locStatus,localTitle,localTextLength:localText.length,failedSourceRequests:failedSrc.slice(0,30),failedLocalRequests:failedLoc.slice(0,30),visual});
+                await src.close(); await loc.close();
+              }
+            }
+            await browser.close();
+            server.kill('SIGTERM');
+            const summary={
+              generatedAt:new Date().toISOString(),
+              port,
+              cases:results,
+              maxVisualMismatch:Math.max(...results.map(x=>x.visual.ratio)),
+              offlineLocalRequestFailures:results.reduce((n,x)=>n+x.failedLocalRequests.length,0),
+              allLocalStatusesOk:results.every(x=>x.localStatus && x.localStatus<400),
+            };
+            fs.writeFileSync(path.join(root,'audit-visual.json'),JSON.stringify(summary,null,2));
+            console.log(JSON.stringify(summary,null,2));
+            if(!summary.allLocalStatusesOk) process.exitCode=2;
+          })().catch(e=>{console.error(e);try{server.kill('SIGTERM')}catch{};process.exit(1)});
+          NODE
+          NODE_PATH="$PWD/audit-runner/node_modules" node audit-runner/audit.cjs
+
+      - name: Inventory
+        if: always()
+        run: |
+          if [ -d portecriativo-export ]; then
+            du -sh portecriativo-export || true
+            find portecriativo-export -type f | sort > portecriativo-export/file-manifest.txt || true
+            find portecriativo-export -type f | wc -l || true
+          fi
+
+      - name: Upload complete export
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: portecriativo-pixel-perfect-export
+          path: portecriativo-export
+          include-hidden-files: true
+          compression-level: 6
+          retention-days: 1
